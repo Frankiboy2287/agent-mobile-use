@@ -13,7 +13,7 @@
 | :--- | :--- |
 | 设备型号 | 小米 15 Pro（`2410DPN6CC`，代号 `haotian`，平台 `sun`） |
 | 系统 | **Android 17**（`ro.build.version.release=17`，**SDK 37**） |
-| 系统版本 | `OS4.0.0.14.XOBCNXM`（HyperOS 4 / OS4.0） |
+| 系统版本 | HyperOS 4（OS4.0） |
 | 安全补丁 | 2026-09-01 |
 | Root 方案 | **FolkPatch（APatch 系，KernelPatch 115032）** |
 | Hook 框架 | **LSPosed 2.2.0-it (7892)** + Zygisk Next 1.5.0 |
@@ -198,7 +198,97 @@ JSON 输出新增 `windows` / `nodes` / `editables` / `focused` 计数，让失�
 * 校验失败时打印明确的手工激活步骤
 * 同步部署 `vd_env.sh` 并清理陈旧的 classpath 缓存（避免 OTA 后沿用旧 jar 列表）
 
-### 2.6 构建工具链修复
+### 2.6 Hook 层三个坑（重启后才暴露）
+
+Hook APK 编译、安装、LSPosed 作用域配置都完成后，重启却发现 **9 个 hook 全部失败**。
+日志给出两个真实原因，都属于"编译能过、运行时才炸"的类型：
+
+#### a) `XC_MethodReplacement.returnConstant` 在 LSPosed IT 分支中不存在
+
+```
+Failed to hook android.view.Display#canHostTasks:
+  No static method returnConstant(Ljava/lang/Object;)Lde/robv/android/xposed/XC_MethodHook;
+  in class Lde/robv/android/xposed/XC_MethodReplacement
+```
+
+上游代码统一用 `XC_MethodReplacement.returnConstant(Boolean.TRUE)` 构造"恒返回 true"的回调。
+该方法在部分 Xposed/LSPosed 分支（实测 **LSPosed IT v2.2.0 (7892)**）中并未提供。
+
+**修复**：改为匿名子类覆写 `replaceHookedMethod` —— 这是 Xposed API 中最基础、
+各分支都保证支持的路径：
+
+```java
+private static XC_MethodReplacement returningTrueCallback() {
+    return new XC_MethodReplacement() {
+        @Override
+        protected Object replaceHookedMethod(MethodHookParam param) throws Throwable {
+            return Boolean.TRUE;
+        }
+    };
+}
+```
+
+> 这个坑有个隐蔽之处：编译期用的 Xposed API stub 里**有** `returnConstant`，
+> 所以编译完全通过，问题只在运行时暴露。因此 stub 里已刻意**移除**该方法，
+> 让同类错误在编译期就被拦下。
+
+#### b) `LogicalDisplay` 在 Android 17 已迁移包名
+
+```
+Failed to hook com.android.server.wm.LogicalDisplay#canHostTasksLocked:
+  java.lang.ClassNotFoundException: com$android$server$wm$LogicalDisplay
+```
+
+`LogicalDisplay` 已从 `com.android.server.wm` 迁移到 **`com.android.server.display`**
+（在真机 `services.jar` 中用 `tools/dex_api_probe.py` 核实）。
+
+**修复**：新增 `hookAllMethodsReturningTrueAnyPackage()`，依次尝试多个候选包名，
+命中第一个存在的即返回，兼容新旧 ROM。
+
+#### c) 成功路径没有日志（可观测性缺陷）
+
+`hookAllMethodsReturningTrue` 原本只在**失败**时写日志。结果是
+"一个 hook 都没成功"与"全部成功"在日志上几乎同样安静 —— 排查时无法区分。
+
+**修复**：成功时也记录，并带上命中的重载数量：
+
+```
+[AgentMobileUseHook] Hooked com.android.server.display.LogicalDisplay#canHostTasksLocked (1 overload(s))
+```
+
+### 2.7 用 `lspctl` 诊断 LSPosed（比直接读写数据库可靠）
+
+LSPosed 自带 CLI `lspctl`（`/data/adb/modules/zygisk_lsposed/lspctl`，也软链在
+`/data/adb/ap/bin/lspctl`）。它要求 Android 运行时环境，直接跑会报
+`Android runtime environment is unavailable; use su instead of tsu`，
+需先注入设备真实 classpath：
+
+```bash
+# 注入 zygote 的真实环境（可复用 vd_env.sh 的解析结果）
+ZP=$(pgrep -f zygote | head -1)
+tr '\0' '\n' < /proc/$ZP/environ | grep -v '^ANDROID_SOCKET_' | sed 's/^/export /' > /data/local/tmp/zenv.sh
+. /data/local/tmp/zenv.sh
+
+LSPCTL=/data/adb/modules/zygisk_lsposed/lspctl
+$LSPCTL status                        # LSPosed 版本 / API / 模块计数
+$LSPCTL module show com.agent.mobileuse   # 模块 APK 路径、启用状态、API 级别
+$LSPCTL module list
+$LSPCTL scope list com.agent.mobileuse    # 当前作用域
+$LSPCTL hook-debug dump               # 逐进程列出所有已注册 hook（含方法签名与备份地址）
+```
+
+`hook-debug dump` 是验证 hook 是否真正注册的最直接手段 —— 它按进程列出每个被 hook 的
+方法签名，可直接 grep 目标方法名。
+
+> 注意：`lspctl` 的**写**操作（`scope set` / `module enable`）会拒绝非 ADB root shell
+> 上下文，报 `mutations are only allowed from an ADB root shell`。读操作不受限。
+> 因此自动配置仍以写数据库为主（见 `customize.sh`），`lspctl` 用于**验证**。
+
+重启后实测 `hook-debug dump` 在 `system_server` 段中列出了全部 14 个 hook 方法
+（9 个目标方法，其中 `canPlaceEntityOnDisplay` 有 3 个重载、`canLaunchOnDisplay` 有 2 个）。
+
+### 2.8 构建工具链修复
+
 
 * `build.sh` 不再硬编码 `/usr/lib/android-sdk`（Ubuntu 各版本布局不同，原版多数环境直接失败）
 * `dx` 已废弃 → 改用 **r8/d8**
@@ -258,16 +348,41 @@ python3 tools/dex_api_probe.py <framework.jar|services.jar> <类名关键字>
 python3 tools/dex_api_probe.py --sig <jar> <类名关键字> [方法名关键字]
 ```
 
-### 3.3 待验证（需重启）
+### 3.3 Hook 注入与跨屏焦点隔离（重启后实测）
 
-LSPosed Hook 的**运行时**效果需要重启后才能确认（Hook 在 `system_server` 启动时注入）：
+修复 §2.6 的两个问题后重启，Hook **全部注入成功**。`lspctl hook-debug dump` 在
+`system_server`（pid 3776）段中列出了全部目标方法：
 
-* 副屏应用启动时主屏焦点不被抢占
-* IME 在不同 display 间的隔离行为
-* Edge Glow 边缘光效与前台通知卡片
+```
+boolean android.view.Display.canHostTasks()
+boolean com.android.server.display.LogicalDisplay.canHostTasksLocked()
+boolean com.android.server.wm.ActivityTaskSupervisor.isCallerAllowedToLaunchOnDisplay(int, int, int, ActivityInfo)
+boolean com.android.server.wm.ActivityTaskSupervisor.isCallerAllowedToLaunchOnTaskDisplayArea(int, int, TaskDisplayArea, ActivityInfo)
+boolean com.android.server.wm.ActivityTaskSupervisor.canPlaceEntityOnDisplay(int, int, int, ActivityInfo)
+boolean com.android.server.wm.ActivityTaskSupervisor.canPlaceEntityOnDisplay(int, int, int, Task)
+boolean com.android.server.wm.ActivityTaskSupervisor.canPlaceEntityOnDisplay(int, int, int, Task, ActivityInfo)
+boolean com.android.server.wm.ActivityRecord.canBeLaunchedOnDisplay(int)
+boolean com.android.server.wm.Task.canBeLaunchedOnDisplay(int)
+boolean com.android.server.wm.RootWindowContainer.canLaunchOnDisplay(ActivityRecord, int)
+boolean com.android.server.wm.RootWindowContainer.canLaunchOnDisplay(ActivityRecord, Task)
+boolean com.android.server.display.DisplayManagerService.validatePackageName(int, String)
+int com.android.server.inputmethod.InputMethodManagerService.computeImeDisplayIdForTarget(int, ImeDisplayValidator)
+```
 
-Hook APK 已重新编译、安装，LSPosed 作用域（`android` / `system` / `com.android.systemui`）
-已写入数据库（经三表回读校验）。
+**最关键的验证 —— 跨屏焦点隔离**（Hook 存在的根本目的）：
+
+| 步骤 | 主屏 `topResumedActivity` |
+| :--- | :--- |
+| 测试前 | `mark.via/.Shell` |
+| `vd start` 创建副屏后 | `mark.via/.Shell` **（未变）** |
+| `vd launch com.android.settings` 在副屏启动设置后 | `mark.via/.Shell` **（仍未变）** |
+
+副屏上 `com.android.settings/.MainSettings` 正常启动并渲染（`mDisplayId=2`，
+`cur=1440x3200`），而**主屏前台应用全程未被抢占** —— 用户在主屏的使用完全不受打扰。
+
+同时验证 IME 归属：`vd tap` 点击副屏搜索框后，`vd type` 直接返回
+`{"ok":true,"mode":"action_set_text","verified_text":"小米15Pro完美适配OK"}`，
+输入法正确归属副屏。
 
 ---
 
