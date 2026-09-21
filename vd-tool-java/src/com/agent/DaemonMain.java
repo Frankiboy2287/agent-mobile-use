@@ -157,16 +157,22 @@ public class DaemonMain {
             int displayId = display.getDisplayId();
             System.out.println("[AgentDaemon] Virtual Display created successfully! ID: " + displayId);
 
-            // Optional: set IME policy to local virtual display (0 = DISPLAY_IME_POLICY_LOCAL)
-            try {
-                Class<?> wmClass = Class.forName("android.view.WindowManagerGlobal");
-                Method getWmService = wmClass.getMethod("getWindowManagerService");
-                Object wmService = getWmService.invoke(null);
-                Method setImePolicy = wmService.getClass().getMethod("setDisplayImePolicy", int.class, int.class);
-                setImePolicy.invoke(wmService, displayId, 0);
+            // 把副屏的 IME 策略设为 LOCAL(0)，让软键盘归属副屏而不是主屏。
+            //
+            // 原实现走 WindowManagerGlobal.getWindowManagerService()，在 Android 17 上
+            // 恒抛 IllegalStateException("ApplicationSharedMemory not initialized")：
+            // API 37 给 WindowManagerGlobal 加了 ApplicationSharedMemory 依赖，而
+            // app_process 直启的进程不会初始化它。详见 ImePolicyHelper 的类注释。
+            //
+            // 走 ServiceManager -> IWindowManager$Stub 的绕行路径已在真机验证可用，
+            // 并且这里会回读 getDisplayImePolicy 校验策略真正落地，而不是"没抛异常就算成功"。
+            String imeErr = ImePolicyHelper.setDisplayImePolicy(displayId, ImePolicyHelper.POLICY_LOCAL);
+            if (imeErr == null) {
                 System.out.println("[AgentDaemon] Set Display " + displayId + " IME policy to LOCAL (0)");
-            } catch (Throwable t) {
-                System.err.println("[AgentDaemon] Warning: Failed to set IME policy: " + t.getMessage());
+            } else {
+                // 不静默降级：IME 策略失败会直接表现为 `vd type` 找不到可编辑焦点节点，
+                // 把原因写清楚，避免又被误判成"方法不存在"。
+                System.err.println("[AgentDaemon] Warning: Failed to set IME policy: " + imeErr);
             }
 
             // Write status

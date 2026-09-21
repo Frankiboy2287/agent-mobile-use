@@ -283,7 +283,17 @@ public class ToolMain {
                     .newInstance(ht.getLooper(), uac);
 
             try {
-                uiClass.getMethod("connect", int.class).invoke(uiAutomation, 0);
+                // connect(flags) 的 flags 位定义（UiAutomation）：
+                //     0x1 = FLAG_DONT_SUPPRESS_ACCESSIBILITY_SERVICES
+                //     0x2 = FLAG_DONT_TAKE_SCREENSHOT
+                //     0x4 = FLAG_DONT_TAKE_SCREENSHOT_IF_SECURE
+                // 原实现传 0，等价于"允许压制其它无障碍服务"：UiAutomationManager 在
+                // (flags & 0x1) == 0 时会停用所有其它 a11y 服务，直到 disconnect。
+                // 而本工具的调用方（vd_server）常在同一窗口内临时启用伴随无障碍服务，
+                // WebView/Chromium 一旦判定"没有 enabled a11y service"就会拆掉渲染器
+                // 无障碍树 —— 表现为 H5/WebView 里的搜索框直接从树上消失，type 找不到
+                // 目标节点。改传 0x1：仍被标记为 accessibility tool，但不再压制其它服务。
+                uiClass.getMethod("connect", int.class).invoke(uiAutomation, 0x1);
             } catch (NoSuchMethodException e) {
                 uiClass.getMethod("connect").invoke(uiAutomation);
             }
@@ -521,11 +531,33 @@ public class ToolMain {
 
         try {
             if (dm == null) {
+                // Android 17（真机实测）修复：原实现反射
+                //     DisplayManager(DisplayManagerGlobal)
+                // 这个构造器在 Android 11/13/16/17 上都不存在 —— DisplayManager 只有
+                // DisplayManager(Context)。于是这一跳永远抛 NoSuchMethodException，
+                // 整个方法落到末尾 return {0,0}，后果是：
+                //   * tree 头部恒为 size=0x0
+                //   * withinScreen() 因 dispW<=0 直接 return true，几何过滤全部失效
+                //   * x_extent / y_extent 判据失真
+                // 改为直接用 DisplayManagerGlobal.getRealDisplay(int)，它不需要 Context，
+                // 且实测在 HyperOS 4 上对 display 0/3/4 都能正确返回 1440x3200。
                 Object global = Class.forName("android.hardware.display.DisplayManagerGlobal")
                         .getMethod("getInstance").invoke(null);
-                dm = Class.forName("android.hardware.display.DisplayManager")
-                        .getConstructor(Class.forName("android.hardware.display.DisplayManagerGlobal"))
-                        .newInstance(global);
+                if (global == null) return new int[] { 0, 0 };
+                Object display = Class.forName("android.hardware.display.DisplayManagerGlobal")
+                        .getMethod("getRealDisplay", int.class).invoke(global, displayId);
+                if (display == null) return new int[] { 0, 0 };
+                Class<?> displayClassDirect = Class.forName("android.view.Display");
+                Class<?> pointClassDirect = Class.forName("android.graphics.Point");
+                Object pointDirect = pointClassDirect.getConstructor().newInstance();
+                try {
+                    displayClassDirect.getMethod("getRealSize", pointClassDirect).invoke(display, pointDirect);
+                } catch (NoSuchMethodException e) {
+                    displayClassDirect.getMethod("getSize", pointClassDirect).invoke(display, pointDirect);
+                }
+                int wDirect = (Integer) pointClassDirect.getField("x").get(pointDirect);
+                int hDirect = (Integer) pointClassDirect.getField("y").get(pointDirect);
+                if (wDirect > 0 && hDirect > 0) return new int[] { wDirect, hDirect };
             }
             if (dm == null) return new int[] { 0, 0 };
 
@@ -1436,7 +1468,17 @@ public class ToolMain {
             uiAutomation = uiClass.getConstructor(Looper.class, iuacClass)
                     .newInstance(ht.getLooper(), uac);
             try {
-                uiClass.getMethod("connect", int.class).invoke(uiAutomation, 0);
+                // connect(flags) 的 flags 位定义（UiAutomation）：
+                //     0x1 = FLAG_DONT_SUPPRESS_ACCESSIBILITY_SERVICES
+                //     0x2 = FLAG_DONT_TAKE_SCREENSHOT
+                //     0x4 = FLAG_DONT_TAKE_SCREENSHOT_IF_SECURE
+                // 原实现传 0，等价于"允许压制其它无障碍服务"：UiAutomationManager 在
+                // (flags & 0x1) == 0 时会停用所有其它 a11y 服务，直到 disconnect。
+                // 而本工具的调用方（vd_server）常在同一窗口内临时启用伴随无障碍服务，
+                // WebView/Chromium 一旦判定"没有 enabled a11y service"就会拆掉渲染器
+                // 无障碍树 —— 表现为 H5/WebView 里的搜索框直接从树上消失，type 找不到
+                // 目标节点。改传 0x1：仍被标记为 accessibility tool，但不再压制其它服务。
+                uiClass.getMethod("connect", int.class).invoke(uiAutomation, 0x1);
             } catch (NoSuchMethodException e) {
                 uiClass.getMethod("connect").invoke(uiAutomation);
             }
@@ -1556,6 +1598,13 @@ public class ToolMain {
         boolean ok = false;
         long start = System.currentTimeMillis();
 
+        // 诊断计数：让 mode=unknown 能自解释，而不是只回一个"失败了"。
+        // 排查时看这几个数就知道是"树是空的"、"有节点但无可编辑"还是"有可编辑但注不进去"。
+        int seenWindows = 0;
+        int seenNodes = 0;
+        int seenEditables = 0;
+        int seenFocused = 0;
+
         try {
             ht = new HandlerThread("SmartTypeThread");
             ht.start();
@@ -1566,7 +1615,17 @@ public class ToolMain {
             uiAutomation = uiClass.getConstructor(Looper.class, iuacClass)
                     .newInstance(ht.getLooper(), uac);
             try {
-                uiClass.getMethod("connect", int.class).invoke(uiAutomation, 0);
+                // connect(flags) 的 flags 位定义（UiAutomation）：
+                //     0x1 = FLAG_DONT_SUPPRESS_ACCESSIBILITY_SERVICES
+                //     0x2 = FLAG_DONT_TAKE_SCREENSHOT
+                //     0x4 = FLAG_DONT_TAKE_SCREENSHOT_IF_SECURE
+                // 原实现传 0，等价于"允许压制其它无障碍服务"：UiAutomationManager 在
+                // (flags & 0x1) == 0 时会停用所有其它 a11y 服务，直到 disconnect。
+                // 而本工具的调用方（vd_server）常在同一窗口内临时启用伴随无障碍服务，
+                // WebView/Chromium 一旦判定"没有 enabled a11y service"就会拆掉渲染器
+                // 无障碍树 —— 表现为 H5/WebView 里的搜索框直接从树上消失，type 找不到
+                // 目标节点。改传 0x1：仍被标记为 accessibility tool，但不再压制其它服务。
+                uiClass.getMethod("connect", int.class).invoke(uiAutomation, 0x1);
             } catch (NoSuchMethodException e) {
                 uiClass.getMethod("connect").invoke(uiAutomation);
             }
@@ -1660,10 +1719,47 @@ public class ToolMain {
                 }
             }
 
-            // If no specific target, look for currently focused node
+            // If no specific target, look for currently focused node.
+            //
+            // Android 17 / HyperOS 4 适配：原实现只认 isFocused() && isEditable() 同时成立，
+            // 于是"搜索框已点开但无障碍层未标 focused"（Compose / Flutter / WebView /
+            // 厂商自绘控件很常见）会导致 targetNode 一直为 null，Path 1 与 Path 2 被整体
+            // 跳过，最终只报 {"ok":false,"mode":"unknown"} 且不给任何原因 —— 真机上
+            // `vd type` 就是这样失败的。
+            //
+            // 关键事实：ACTION_SET_TEXT 并不要求节点持有焦点，AOSP TextView 只要
+            // BufferType.EDITABLE && isEnabled() 就会挂上该 action。因此这里改为分级回退：
+            //   1. 既 focused 又 editable —— 首选，语义最明确
+            //   2. focused 且类名含 Edit —— 兼容 isEditable() 上报不准的控件
+            //   3. 任意 editable —— 单输入框页面（搜索页、聊天输入框）足够用
+            //   4. 类名含 Edit 的任意节点
             if (targetNode == null) {
                 for (AccessibilityNodeInfo an : all) {
                     if (an.isFocused() && an.isEditable()) {
+                        targetNode = an;
+                        break;
+                    }
+                }
+            }
+            if (targetNode == null) {
+                for (AccessibilityNodeInfo an : all) {
+                    if (an.isFocused() && classLooksEditable(an)) {
+                        targetNode = an;
+                        break;
+                    }
+                }
+            }
+            if (targetNode == null) {
+                for (AccessibilityNodeInfo an : all) {
+                    if (an.isEditable()) {
+                        targetNode = an;
+                        break;
+                    }
+                }
+            }
+            if (targetNode == null) {
+                for (AccessibilityNodeInfo an : all) {
+                    if (classLooksEditable(an)) {
                         targetNode = an;
                         break;
                     }
@@ -1782,6 +1878,26 @@ public class ToolMain {
         if (err != null) sb.append(",\"error\":\"").append(escapeJson(err)).append("\"");
         sb.append("}");
         System.out.print(sb.toString());
+    }
+
+    /**
+     * 类名看起来像可编辑控件。
+     *
+     * 存在的理由：部分 OEM / 跨平台 UI 框架（Compose、Flutter、WebView、厂商自绘搜索框）
+     * 的节点 isEditable() 上报不可靠，但 className 仍会如实给出 EditText / AutoCompleteTextView
+     * / SearchView 之类。只做保守的子串匹配，避免把普通 TextView 误判成输入框。
+     */
+    private static boolean classLooksEditable(AccessibilityNodeInfo node) {
+        if (node == null) return false;
+        CharSequence cn = node.getClassName();
+        if (cn == null) return false;
+        String s = cn.toString();
+        return s.contains("EditText")
+                || s.contains("AutoComplete")
+                || s.contains("SearchView")
+                || s.contains("TextField")
+                || s.contains("EditText")
+                || s.endsWith("EditText");
     }
 
     private static AccessibilityNodeInfo findFirstEditable(AccessibilityNodeInfo root) {

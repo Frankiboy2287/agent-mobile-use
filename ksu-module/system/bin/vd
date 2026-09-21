@@ -1,18 +1,58 @@
 #!/system/bin/sh
+# =============================================================================
+# vd — Agent Mobile Use 虚拟副屏控制总线
+#
+# 本版本针对「非 ColorOS 厂商」做了通用化适配（小米 / 三星 / AOSP 等）：
+#   * BOOTCLASSPATH 不再硬编码 OPPO 专属 jar，改由 bin/vd_env.sh 动态解析
+#   * screencap 修正为 SurfaceFlinger display token（API 30+ 不再接受 display id）
+#   * 新增 doctor 诊断子命令，便于在新机型上快速定位适配问题
+#   * 分辨率 / DPI 文案不再写死 1080x2400@420，改为读真实状态
+# =============================================================================
 MODDIR="/data/adb/modules/agent_mobile_use"
 if [ ! -d "$MODDIR" ]; then
-    MODDIR="$(cd "$(dirname "$0")/../.." && pwd)"
+    MODDIR="$(cd "$(dirname "$0")/../.." 2>/dev/null && pwd)"
 fi
+[ -d "$MODDIR" ] || MODDIR="/data/local/tmp"
 
 STATUS_FILE="/data/local/tmp/vd_status.json"
 STOP_SIGNAL="/data/local/tmp/vd_stop"
 RUN_SCRIPT="$MODDIR/bin/run_daemon.sh"
 SERVER_BIN="$MODDIR/bin/vd_server"
 TOOLS_DEX="$MODDIR/bin/agent_tools.dex"
-if [ ! -f "$TOOLS_DEX" ]; then
-    TOOLS_DEX="/data/local/tmp/agent_tools.dex"
+VD_ENV="$MODDIR/bin/vd_env.sh"
+
+# 安装后 run_daemon.sh / dex 会复制到 /data/local/tmp 以便即时生效
+[ -f "$RUN_SCRIPT" ] || RUN_SCRIPT="/data/local/tmp/run_daemon.sh"
+[ -f "$TOOLS_DEX" ] || TOOLS_DEX="/data/local/tmp/agent_tools.dex"
+[ -f "$VD_ENV" ] || VD_ENV="/data/local/tmp/vd_env.sh"
+
+# ---- 载入跨厂商环境解析器 -----------------------------------------------
+if [ -f "$VD_ENV" ]; then
+    . "$VD_ENV"
 fi
 
+# 兜底：若 vd_env.sh 缺失（例如热更新只替换了 vd），退化到 zygote 读取
+if ! command -v vd_export_app_process_env >/dev/null 2>&1; then
+    vd_export_app_process_env() {
+        export ANDROID_ROOT=/system
+        export ANDROID_DATA=/data
+        export ANDROID_ART_ROOT=/apex/com.android.art
+        [ -d /apex/com.android.i18n ] && export ANDROID_I18N_ROOT=/apex/com.android.i18n
+        [ -d /apex/com.android.tzdata ] && export ANDROID_TZDATA_ROOT=/apex/com.android.tzdata
+        _zp=$(pgrep -f zygote 2>/dev/null | head -n 1)
+        if [ -n "$_zp" ] && [ -r "/proc/$_zp/environ" ]; then
+            export BOOTCLASSPATH=$(tr '\0' '\n' < "/proc/$_zp/environ" 2>/dev/null \
+                | grep '^BOOTCLASSPATH=' | head -n 1 | cut -d= -f2-)
+            export DEX2OATBOOTCLASSPATH=$(tr '\0' '\n' < "/proc/$_zp/environ" 2>/dev/null \
+                | grep '^DEX2OATBOOTCLASSPATH=' | head -n 1 | cut -d= -f2-)
+        fi
+        [ -n "$BOOTCLASSPATH" ] || return 1
+        [ -n "$DEX2OATBOOTCLASSPATH" ] || export DEX2OATBOOTCLASSPATH="$BOOTCLASSPATH"
+        return 0
+    }
+fi
+
+# ---- 状态查询 ------------------------------------------------------------
 is_running() {
     if [ -f "$STATUS_FILE" ]; then
         local st=$(grep -o '"status":"[^"]*"' "$STATUS_FILE" 2>/dev/null | head -n 1 | cut -d'"' -f4)
@@ -32,6 +72,18 @@ get_display_id() {
     fi
 }
 
+get_status_field() {
+    grep -o "\"$1\":[0-9]*" "$STATUS_FILE" 2>/dev/null | head -n 1 | cut -d':' -f2
+}
+
+# 解析副屏的 SurfaceFlinger display token
+# API 30+ 的 screencap 只接受 SF token（64bit 十进制），不再接受 display id。
+get_sf_token() {
+    dumpsys SurfaceFlinger --display-id 2>/dev/null \
+        | grep -i 'AgentVirtualDisplay' | head -n 1 | awk '{print $2}'
+}
+
+# ---- Web 网关 ------------------------------------------------------------
 start_web() {
     if ! pgrep -f "vd_server" >/dev/null 2>&1; then
         if [ -x "$SERVER_BIN" ]; then
@@ -41,6 +93,7 @@ start_web() {
     fi
 }
 
+# ---- 生命周期 ------------------------------------------------------------
 start_vd() {
     start_web
 
@@ -55,7 +108,7 @@ start_vd() {
     rm -f "$STOP_SIGNAL"
     nohup "$RUN_SCRIPT" > /data/local/tmp/daemon.log 2>&1 &
 
-    for i in $(seq 1 30); do
+    for i in $(seq 1 60); do
         sleep 0.1
         if is_running; then
             break
@@ -64,10 +117,15 @@ start_vd() {
 
     if is_running; then
         local did=$(get_display_id)
-        echo "[vd] 虚拟副屏启动成功! (Display $did, 1080x2400, 420 DPI)"
+        local w=$(get_status_field width)
+        local h=$(get_status_field height)
+        local d=$(get_status_field dpi)
+        echo "[vd] 虚拟副屏启动成功! (Display $did, ${w}x${h}, ${d} DPI)"
         echo "[vd] 快照监控就绪: http://127.0.0.1:3070"
     else
         echo "[vd] 启动失败，请检查 /data/local/tmp/daemon.log"
+        echo "[vd] 诊断提示: 执行 'vd doctor' 可定位 BOOTCLASSPATH 与依赖问题"
+        tail -n 5 /data/local/tmp/daemon.log 2>/dev/null | sed 's/^/    /'
         return 1
     fi
 }
@@ -75,7 +133,7 @@ start_vd() {
 stop_vd() {
     echo "[vd] 正在释放虚拟副屏..."
     touch "$STOP_SIGNAL"
-    for i in $(seq 1 20); do
+    for i in $(seq 1 40); do
         sleep 0.1
         if ! is_running; then
             break
@@ -95,9 +153,12 @@ stop_vd() {
 show_status() {
     if is_running; then
         local did=$(get_display_id)
+        local w=$(get_status_field width)
+        local h=$(get_status_field height)
+        local d=$(get_status_field dpi)
         echo "状态: 运行中"
         echo "Display ID: $did"
-        echo "规格: 1080 x 2400 (420 DPI)"
+        echo "规格: ${w} x ${h} (${d} DPI)"
         echo "快照网页: http://127.0.0.1:3070"
     else
         echo "状态: 已休眠 (0 功耗)"
@@ -105,6 +166,7 @@ show_status() {
     fi
 }
 
+# ---- 应用调度 ------------------------------------------------------------
 launch_app() {
     local pkg="$1"
     if [ -z "$pkg" ]; then
@@ -126,18 +188,68 @@ launch_app() {
     fi
 }
 
+# ---- app_process 调用封装 ------------------------------------------------
 run_tool() {
-    export ANDROID_ROOT=/system
-    export ANDROID_DATA=/data
-    export ANDROID_ART_ROOT=/apex/com.android.art
-    export ANDROID_I18N_ROOT=/apex/com.android.i18n
-    export ANDROID_TZDATA_ROOT=/apex/com.android.tzdata
-    export BOOTCLASSPATH=/apex/com.android.art/javalib/core-oj.jar:/apex/com.android.art/javalib/core-libart.jar:/apex/com.android.art/javalib/okhttp.jar:/apex/com.android.art/javalib/bouncycastle.jar:/apex/com.android.art/javalib/apache-xml.jar:/system/framework/framework.jar:/system/framework/framework-graphics.jar:/system/framework/framework-location.jar:/system/framework/ext.jar:/system/framework/telephony-common.jar:/system/framework/voip-common.jar:/system/framework/ims-common.jar:/system/framework/framework-ondeviceintelligence-platform.jar:/system/framework/framework-nfc.jar:/system/framework/tcmiface.jar:/system/framework/qcom.fmradio.jar:/system/framework/QPerformance.jar:/system/framework/UxPerformance.jar:/system/framework/WfdCommon.jar:/system/framework/oplus-framework.jar:/system/framework/subsystem-framework.jar:/apex/com.android.i18n/javalib/core-icu4j.jar:/apex/com.android.adservices/javalib/framework-adservices.jar:/apex/com.android.adservices/javalib/framework-sdksandbox.jar:/apex/com.android.appsearch/javalib/framework-appsearch.jar:/apex/com.android.configinfrastructure/javalib/framework-configinfrastructure.jar:/apex/com.android.conscrypt/javalib/conscrypt.jar:/apex/com.android.crashrecovery/javalib/framework-crashrecovery.jar:/apex/com.android.devicelock/javalib/framework-devicelock.jar:/apex/com.android.healthfitness/javalib/framework-healthfitness.jar:/apex/com.android.ipsec/javalib/android.net.ipsec.ike.jar:/apex/com.android.media/javalib/updatable-media.jar:/apex/com.android.mediaprovider/javalib/framework-mediaprovider.jar:/apex/com.android.mediaprovider/javalib/framework-pdf.jar:/apex/com.android.mediaprovider/javalib/framework-pdf-v.jar:/apex/com.android.mediaprovider/javalib/framework-photopicker.jar:/apex/com.android.ondevicepersonalization/javalib/framework-ondevicepersonalization.jar:/apex/com.android.os.statsd/javalib/framework-statsd.jar:/apex/com.android.permission/javalib/framework-permission.jar:/apex/com.android.permission/javalib/framework-permission-s.jar:/apex/com.android.profiling/javalib/framework-profiling.jar:/apex/com.android.scheduling/javalib/framework-scheduling.jar:/apex/com.android.sdkext/javalib/framework-sdkextensions.jar:/apex/com.android.tethering/javalib/framework-connectivity.jar:/apex/com.android.tethering/javalib/framework-connectivity-b.jar:/apex/com.android.tethering/javalib/framework-connectivity-t.jar:/apex/com.android.tethering/javalib/framework-tethering.jar:/apex/com.android.uwb/javalib/framework-ranging.jar:/apex/com.android.uwb/javalib/framework-uwb.jar:/apex/com.android.virt/javalib/framework-virtualization.jar:/apex/com.android.wifi/javalib/framework-wifi.jar
-    export DEX2OATBOOTCLASSPATH=/apex/com.android.art/javalib/core-oj.jar:/apex/com.android.art/javalib/core-libart.jar:/apex/com.android.art/javalib/okhttp.jar:/apex/com.android.art/javalib/bouncycastle.jar:/apex/com.android.art/javalib/apache-xml.jar:/system/framework/framework.jar:/system/framework/framework-graphics.jar:/system/framework/framework-location.jar:/system/framework/ext.jar:/system/framework/telephony-common.jar:/system/framework/voip-common.jar:/system/framework/ims-common.jar:/system/framework/framework-ondeviceintelligence-platform.jar:/system/framework/framework-nfc.jar:/system/framework/tcmiface.jar:/system/framework/qcom.fmradio.jar:/system/framework/QPerformance.jar:/system/framework/UxPerformance.jar:/system/framework/WfdCommon.jar:/system/framework/oplus-framework.jar:/system/framework/subsystem-framework.jar:/apex/com.android.i18n/javalib/core-icu4j.jar
+    if ! vd_export_app_process_env; then
+        echo "[vd] 错误: 无法建立 app_process 运行环境 (BOOTCLASSPATH 解析失败)" >&2
+        return 1
+    fi
     export CLASSPATH="$TOOLS_DEX"
     /system/bin/app_process /system/bin com.agent.ToolMain "$@"
 }
 
+# ---- 诊断子命令 ----------------------------------------------------------
+doctor() {
+    echo "==================== vd doctor ===================="
+    echo "[环境]"
+    echo "  设备: $(getprop ro.product.brand) $(getprop ro.product.model) ($(getprop ro.product.device))"
+    echo "  系统: Android $(getprop ro.build.version.release) (SDK $(getprop ro.build.version.sdk))"
+    echo "  版本: $(getprop ro.build.version.incremental)"
+    echo "  Root: $(if [ -d /data/adb/ap ]; then echo FolkPatch/APatch; elif [ -d /data/adb/ksu ]; then echo KernelSU; elif [ -d /data/adb/magisk ]; then echo Magisk; else echo 未知; fi)"
+    echo
+    echo "[模块文件]"
+    for f in "$RUN_SCRIPT" "$SERVER_BIN" "$TOOLS_DEX" "$VD_ENV"; do
+        if [ -f "$f" ]; then echo "  OK   $f"; else echo "  缺失 $f"; fi
+    done
+    echo
+    echo "[BOOTCLASSPATH]"
+    if command -v vd_bootclasspath_summary >/dev/null 2>&1; then
+        vd_bootclasspath_summary | sed 's/^/  /'
+    else
+        echo "  (vd_env.sh 未部署，无法诊断)"
+    fi
+    echo
+    echo "[app_process 自检]"
+    if vd_export_app_process_env 2>/dev/null; then
+        export CLASSPATH="$TOOLS_DEX"
+        out=$(/system/bin/app_process /system/bin com.agent.ToolMain 2>&1 | head -n 1)
+        case "$out" in
+            Usage:*) echo "  OK   app_process 可正常启动 Java 工具层" ;;
+            *)       echo "  失败 输出: $out" ;;
+        esac
+    else
+        echo "  失败 无法解析 BOOTCLASSPATH"
+    fi
+    echo
+    echo "[副屏状态]"
+    if is_running; then
+        echo "  运行中, Display $(get_display_id)"
+        local tk=$(get_sf_token)
+        echo "  SurfaceFlinger token: ${tk:-未找到}"
+    else
+        echo "  未运行"
+    fi
+    echo
+    echo "[Web 网关]"
+    if pgrep -f vd_server >/dev/null 2>&1; then
+        echo "  运行中: $(curl -s --max-time 3 http://127.0.0.1:3070/api/status 2>/dev/null)"
+    else
+        echo "  未运行"
+    fi
+    echo "==================================================="
+}
+
+# ---- 主分发 --------------------------------------------------------------
 case "$1" in
     start)
         start_vd
@@ -152,6 +264,9 @@ case "$1" in
         ;;
     status)
         show_status
+        ;;
+    doctor|selfcheck|diag)
+        doctor
         ;;
     launch)
         launch_app "$2"
@@ -181,25 +296,31 @@ case "$1" in
         did=$(get_display_id)
         input -d "$did" keyevent "$2"
         ;;
-    screenshot)
+    screenshot|shot)
         if ! is_running; then echo "副屏未运行"; exit 1; fi
         did=$(get_display_id)
         out="${2:-/data/local/tmp/vd_screenshot.png}"
-        sf_id=$(dumpsys SurfaceFlinger --display-id 2>/dev/null | grep -i 'AgentVirtualDisplay' | awk '{print $2}')
+        # API 30+ 起 screencap 只认 SurfaceFlinger 的 64bit display token。
+        # 传入 display id 会得到 "Display Id 'N' is not valid."
+        sf_id=$(get_sf_token)
         if [ -n "$sf_id" ]; then
-            screencap -d "$sf_id" -p "$out"
-        else
-            screencap -d "$did" -p "$out"
+            screencap -d "$sf_id" -p "$out" 2>/dev/null
         fi
-        if [ -f "$out" ]; then
+        if [ ! -s "$out" ]; then
+            # 回退 1: 直接借 SurfaceFlinger 的虚拟屏 token 失败，尝试主屏
+            # （仅在确实需要画面时使用，注意这会是主屏内容）
+            echo "[vd] 警告: 未能通过 token 截取副屏，回退到主屏截图" >&2
+            screencap -p "$out" 2>/dev/null
+        fi
+        if [ -s "$out" ]; then
             echo "[vd] 快照已保存至: $out"
         else
-            echo "[vd] 截图失败"
+            echo "[vd] 截图失败 (display=$did, token=${sf_id:-无})"
             exit 1
         fi
         ;;
-    *)
-        echo "Agent Mobile Use - 虚拟副屏全能控制总线 (v3.0)"
+    help|-h|--help|"")
+        echo "Agent Mobile Use - 虚拟副屏全能控制总线 (v4.7-xiaomi)"
         echo ""
         echo "用法: vd <command> [args...]"
         echo ""
@@ -216,6 +337,14 @@ case "$1" in
         echo "  stop                         注销副屏，释放全部显存与计算功耗"
         echo "  restart                      重启副屏守护进程"
         echo "  status                       查看当前副屏状态与 Web 链接"
-        echo "  launch <pkg>                 在副屏中定向启动应用 (如 com.sankuai.meituan)"
+        echo "  launch <pkg>                 在副屏中定向启动应用 (如 com.android.settings)"
+        echo ""
+        echo "适配诊断:"
+        echo "  doctor                       输出机型/BOOTCLASSPATH/依赖自检报告"
+        ;;
+    *)
+        echo "未知命令: $1"
+        echo "执行 'vd' 或 'vd help' 查看全部命令。"
+        exit 1
         ;;
 esac

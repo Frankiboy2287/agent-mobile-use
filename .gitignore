@@ -6,3 +6,10 @@
 # top-level directory, so vd-tool-java/bin/classes/*.class stayed tracked.
 **/bin/classes/
 **/probe-java/classes/
+
+# Android APK build output (agent-hook-apk/build.sh)
+agent-hook-apk/build/
+
+# Python tool cache
+__pycache__/
+*.pyc
