@@ -7,7 +7,7 @@
 <a name="中文说明"></a>
 ## 中文说明
 
-本项目提供一套针对 Android（以 ColorOS / Android 16 为第一实验环境）深度定制的 **完全静默、后台独立运行、与物理主屏完全解耦** 的系统级控制底座。
+本项目提供一套针对 Android 深度定制的 **完全静默、后台独立运行、与物理主屏完全解耦** 的系统级控制底座。已在 **ColorOS / Android 16** 与 **小米 HyperOS / Android 17** 两类真机上完成全流程验证，v4.7 起 `BOOTCLASSPATH` 自动适配各厂商 ROM。
 
 通过底层的特权虚拟显示器（Virtual Display）、LSPosed 跨屏调度拦截、以及免软键盘弹窗的无障碍文字注入，为大模型 Agent、自动化测试系统及远程控制脚本提供第一层设备操纵能力。
 
@@ -31,18 +31,21 @@
 
 ### 试验环境声明 (Test Environment)
 
-本系统在以下真机实验环境下完成全流程开发、调试与自动化闭环验证：
+本系统已在**多厂商真机**上完成全流程开发、调试与自动化闭环验证：
 
-| 维度 | 实测实验配置 |
-| :--- | :--- |
-| **设备型号** | 真实 Android 物理机 (ColorOS 16 深度定制系统) |
-| **系统版本** | Android 16 (基于 6.12 内核分支) |
-| **安全补丁级别** | **2025 年 12 月 / 2026 年最新补丁环境** |
-| **Root 方案** | **KernelSU (KSU)** (非解锁 Bootloader 状态，无缝特权注入) |
-| **Hook 框架** | **LSPosed** (通过 Zygisk / KSU 驱动模块注入 `system_server` 进程) |
-| **物理主屏规格** | 1272 x 2800 @ 560 DPI (副屏由守护脚本自适应匹配该规格) |
+| 维度 | 实验环境 A（首发环境） | 实验环境 B（小米适配） |
+| :--- | :--- | :--- |
+| **设备型号** | 真实 Android 物理机 (ColorOS 16 深度定制) | **小米 15 Pro**（`haotian`） |
+| **系统版本** | Android 16 (6.12 内核分支) | **Android 17 (SDK 37) / HyperOS 4** |
+| **安全补丁级别** | 2025 年 12 月 / 2026 年最新补丁环境 | 2026 年最新补丁环境 |
+| **Root 方案** | KernelSU (KSU) | **FolkPatch (APatch / KernelPatch 系)** |
+| **Hook 框架** | LSPosed (经 Zygisk / KSU 注入 `system_server`) | **LSPosed 2.2.0-it + Zygisk Next** |
+| **物理主屏规格** | 1272 x 2800 @ 560 DPI | **1440 x 3200 @ 600 DPI** |
 
-> **提示**：如果您的设备处于不同厂商系统（如 MIUI/HyperOS、OneUI、原生 AOSP）或不同 Android 版本，请务必参阅后文的 [兼容性与二次适配说明](#兼容性与二次适配说明)。
+> **兼容性提示**：自 v4.7 起，`BOOTCLASSPATH` 已改为**运行时自动解析**（见下文说明），
+> 因此 HyperOS / OneUI / 原生 AOSP 等非 ColorOS 设备**无需再手改脚本**即可运行。
+> 换机型或 OTA 后建议先执行 `vd doctor` 做一次环境自检。
+> 小米/HyperOS/Android 17 的完整适配记录另见 **[XIAOMI-ADAPTATION.md](XIAOMI-ADAPTATION.md)**。
 
 ---
 
@@ -78,6 +81,10 @@
 - **`vd key <keycode>`**：向副屏发送系统物理按键（如 4 为返回，3 为主页，66 为回车）。
 - **`vd screenshot [path]`**：定向截取副屏当前帧并保存为 PNG 图片（默认路径 `/data/local/tmp/vd_screenshot.png`）。
 
+**适配诊断**：
+
+- **`vd doctor`**：一键输出环境自检报告 —— 机型/系统/Root 方案识别、模块文件完整性、**BOOTCLASSPATH 解析结果（含厂商定制 jar 识别）**、`app_process` 可启动性、副屏状态、3070 网关连通性。换机型、OTA 升级或遇到启动失败时，先跑这个命令定位问题。
+
 #### 2. HTTP / REST 监控网关 (Port 3070)
 
 由纯静态 Go 服务 `vd_server` 提供：
@@ -96,20 +103,41 @@
 #### 方式一：直接刷入发行版（推荐）
 
 1. 从 `release/` 目录或 GitHub Releases 下载预编译好的刷机包：
-   **`agent-mobile-use-ksu-v4.6.zip`**
+   **`agent-mobile-use-ksu-v4.7-xiaomi.zip`**
+   （v4.7 起为跨厂商版本，ColorOS / HyperOS / OneUI / AOSP 通用）
 2. 将 zip 文件传输至手机中。
-3. 打开 **KernelSU** (或 APatch / Magisk) 管理器 -> 点击「模块」-> 选择该 zip 进行安装。
+3. 打开 **KernelSU / FolkPatch(APatch) / Magisk** 管理器 -> 点击「模块」-> 选择该 zip 进行安装。
 4. 安装过程中脚本会自动完成以下动作：
    - 安装静默 Hook APK (`agent_hook.apk`)；
-   - 自动检测本地 LSPosed 数据库并激活 `system` 和 `android` 作用域；
-   - 将 `vd` 部署至 `/system/bin/vd`。
+   - 自动检测本地 LSPosed 数据库并写入作用域（`android` / `system` / `com.android.systemui`），
+     写入后**回读校验**；失败时会打印手工激活步骤；
+   - 将 `vd` 部署至 `/system/bin/vd`，并把 dex 与 `vd_env.sh` 部署到 `/data/local/tmp`
+     （免重启即可调用工具链）。
 5. 重启手机使 LSPosed Hook 与系统服务挂载生效。
+6. 重启后执行 **`vd doctor`** 自检，确认环境无误：
+
+   ```
+   vd doctor
+   ```
+
+   重点看 `[BOOTCLASSPATH]` 段是否解析出本机条目（小米设备应包含
+   `miui-framework.jar` 等厂商定制 jar）与 `[app_process 自检]` 是否为 `OK`。
+
+> **Hook 不生效时**：打开 LSPosed 管理器确认「Agent Mobile Use Hook」已启用且作用域包含
+> 「系统框架 / 系统界面」。也可用 `lspctl module show com.agent.mobileuse` 与
+> `lspctl hook-debug dump` 验证 hook 是否真正注册。
 
 #### 方式二：手动编译源码
 
-- 编译 Java 组件：进入 `vd-tool-java/` 目录，执行 `./build.sh`。
+- 编译 Java 工具链（生成 `agent_tools.dex` / `agent_vd.dex`）：
+  进入 `vd-tool-java/` 目录，执行 `./build.sh`
+  （自动探测 `android.jar` 与 `d8`；请确保已备好 Android SDK 平台 jar）。
+- 编译 Hook APK：进入 `agent-hook-apk/` 目录，执行 `./build.sh`
+  （自动探测 `android.jar` / `aapt2` / `d8` / `zipalign` / `apksigner`，
+  Xposed API 由编译期 stub 提供，可用 `XPOSED_STUB_DIR` 覆盖）。
 - 编译 Go 服务：进入 `vd-server-go/` 目录，执行 `./build.sh`（静态交叉编译）。
-- 组装并打包：在 `ksu-module/` 执行 `./pack.sh` 生成模块 zip。
+- 组装并打包：在 `ksu-module/` 执行 `./pack.sh` 生成模块 zip
+  （脚本会同步最新的 dex、`vd_server` 与 Hook APK，并输出到仓库根目录）。
 
 #### 热更新线上 `vd_server`（不刷模块）
 
@@ -145,20 +173,48 @@
 
 ### 兼容性与二次适配说明
 
-1. **`BOOTCLASSPATH` 环境变量解耦**：
-   - 在 `system/bin/vd` 与 `ksu-module/bin/run_daemon.sh` 中配置的 `BOOTCLASSPATH` 当前包含了 ColorOS 特定的 framework 包（例如 `oplus-framework.jar`）。
-   - **非 OPPO/OnePlus 设备适配**：若在原生 Android、小米或三星设备上运行报错，请自行修改脚本中的 `BOOTCLASSPATH`，动态获取系统默认类路径以适应目标机型。
-2. **LSPosed 模块配置路径差异**：
-   - `customize.sh` 默认操作的 LSPosed 数据库路径为 `/data/adb/lspd/config/modules_config.db`。若使用其他变种，请手动打开 LSPosed App，勾选「Agent Mobile Use Hook」，并勾选「系统框架 (Android)」后重启即可。
-3. **特定 App 副屏控件树降级策略**：
-   - 部分第三方加固应用（如微信）在未连接真实物理触摸板的虚拟副屏上，系统默认会压制无障碍节点生成（`UiAutomation` 获取为空树）。针对此类应用，请以截屏视觉感知（`vd screenshot` + 坐标推理）作为主链路。
+> v4.7 起，原先需要用户手工处理的**跨厂商适配项已自动完成**。以下标注了各项的当前状态。
+
+1. **`BOOTCLASSPATH` 跨厂商化（v4.7 已自动处理，无需手改）**：
+   - **旧行为的问题**：`system/bin/vd` 与 `ksu-module/bin/run_daemon.sh` 曾把 ColorOS 专属的 framework 包
+     （`oplus-framework.jar`、`subsystem-framework.jar`、`qcom.fmradio.jar`）整条硬编码进 `BOOTCLASSPATH`。
+     这些文件在小米/三星/AOSP 设备上并不存在，而 Android 17 的 ART 对 boot classpath 做**硬校验**，
+     缺失时不是抛 Java 异常而是直接 `SIGABRT`（`Aborted`，退出码 134）。
+     同时该清单还遗漏了厂商必需的 jar（例如小米的 `miui-framework.jar`，系统所需的
+     `android/graphics/animation/RTAnimator` 由它提供）。
+   - **现在的做法**：新增 `ksu-module/bin/vd_env.sh`，按优先级 **动态解析** 并逐项校验存在性：
+     ① 从 zygote 的 `/proc/<pid>/environ` 读取设备真实 `BOOTCLASSPATH`（唯一能 100% 覆盖厂商定制 jar 的方式）；
+     ② 回退时扫描 `/apex/*/javalib` 与各 framework 目录动态拼装；
+     ③ 结果按「设备名_Android版本_增量版本」指纹缓存，OTA 后自动失效重建。
+     实测小米 15 Pro 上解析出 65 项（含 8 个小米定制 jar），ColorOS 环境同样可用。
+   - **你需要做的**：什么都不用做。若启动失败，执行 `vd doctor` 查看 BOOTCLASSPATH 解析段，
+     必要时删除缓存 `rm /data/local/tmp/vd_bootclasspath.txt` 后重试。
+
+2. **`screencap` 的 display 参数语义（v4.7 已修复）**：
+   - API 30+ 的 `screencap -d` 接受的是 **SurfaceFlinger 的 64bit display token**，而非逻辑 display id。
+     传逻辑 id 会得到 `Display Id 'N' is not valid.`。
+   - `vd screenshot` 现已自动从 `dumpsys SurfaceFlinger --display-id` 解析 token。
+   - ⚠️ 注意区分：`input -d` 用的是**逻辑 display id**，两者语义不同，不要混用。
+
+3. **LSPosed 模块配置**：
+   - `customize.sh` 默认操作 `/data/adb/lspd/config/modules_config.db`（上游 LSPosed 及 IT 分支表结构一致），
+     安装时会自动写入模块注册与作用域（`android` / `system` / `com.android.systemui`），并**回读校验**；
+     校验失败时会打印手工配置步骤。
+   - 若使用其他变种，请手动打开 LSPosed App，勾选「Agent Mobile Use Hook」与作用域「系统框架 / 系统界面」后重启。
+   - 可用 LSPosed 自带 CLI 验证（读操作无需 root shell）：
+     `lspctl module show com.agent.mobileuse`、`lspctl scope list com.agent.mobileuse`、
+     `lspctl hook-debug dump`（逐进程列出已注册 hook）。写操作要求 ADB root shell。
+
+4. **特定 App 副屏控件树降级策略**：
+   - 部分第三方加固应用（如微信）在未连接真实物理触摸板的虚拟副屏上，系统默认会压制无障碍节点生成
+     （`UiAutomation` 获取为空树）。针对此类应用，请以截屏视觉感知（`vd screenshot` + 坐标推理）作为主链路。
 
 ---
 
 <a name="english"></a>
 ## English Description
 
-`agent-mobile-use` provides an industrial-grade, fully silent, background headless virtual display and low-level control foundation for Android (tested on ColorOS 16 / Android 16).
+`agent-mobile-use` provides an industrial-grade, fully silent, background headless virtual display and low-level control foundation for Android. Verified end-to-end on both **ColorOS / Android 16** and **Xiaomi HyperOS / Android 17**; since v4.7 `BOOTCLASSPATH` is resolved at runtime, so vendor ROMs need no manual patching.
 
 By decoupling execution onto an independent virtual display (Display > 0), intercepting task/activity focus switches with LSPosed hooks, and injecting text via accessibility without popping up soft keyboards, this project provides a clean substrate for LLM Agents and automated systems.
 
@@ -182,14 +238,21 @@ The whole drawing process took place entirely in the background virtual display 
 
 ### Experimental Verification Environment
 
-| Aspect | Tested Configuration |
-| :--- | :--- |
-| **Device** | Physical Android device (ColorOS 16 custom ROM) |
-| **Android Version** | Android 16 (Linux Kernel 6.12) |
-| **Security Patch** | **Dec 2025 / 2026 Latest Security Patch Level** |
-| **Root Solution** | **KernelSU (KSU)** (No BL unlock required) |
-| **Hook Engine** | **LSPosed** (Injected into `system_server`) |
-| **Physical Display** | 1272 x 2800 @ 560 DPI (Auto-mirrored by daemon) |
+Verified on two vendor ROMs:
+
+| Aspect | Environment A (initial) | Environment B (Xiaomi) |
+| :--- | :--- | :--- |
+| **Device** | Physical Android device (ColorOS 16) | **Xiaomi 15 Pro** (`haotian`) |
+| **Android Version** | Android 16 (Linux Kernel 6.12) | **Android 17 (SDK 37) / HyperOS 4** |
+| **Security Patch** | Dec 2025 / 2026 Latest | 2026 Latest |
+| **Root Solution** | KernelSU (KSU) | **FolkPatch (APatch / KernelPatch)** |
+| **Hook Engine** | LSPosed (injected into `system_server`) | **LSPosed 2.2.0-it + Zygisk Next** |
+| **Physical Display** | 1272 x 2800 @ 560 DPI | **1440 x 3200 @ 600 DPI** |
+
+Since v4.7 `BOOTCLASSPATH` is auto-resolved per ROM (see `ksu-module/bin/vd_env.sh`), so
+HyperOS / OneUI / AOSP devices run without hand-editing scripts. Run `vd doctor` for a
+self-check after switching devices or applying an OTA.
+Full adaptation notes: **[XIAOMI-ADAPTATION.md](XIAOMI-ADAPTATION.md)**.
 
 ---
 
@@ -204,6 +267,12 @@ The whole drawing process took place entirely in the background virtual display 
    - `vd swipe <x1> <y1> <x2> <y2> [duration]`: Simulate drag/swipe gestures or brush strokes.
    - `vd key <keycode>`: Send key events (e.g. 4 for BACK, 3 for HOME, 66 for ENTER).
    - `vd screenshot [path]`: Take a direct frame capture of the virtual display.
+
+   **Diagnostics**:
+   - `vd doctor`: Print a one-shot environment self-check — device/ROM detection, Root solution,
+     module file integrity, **resolved `BOOTCLASSPATH` (with vendor jar detection)**, `app_process`
+     launchability, virtual display state and gateway reachability. Run this first after switching
+     devices, applying an OTA, or when startup fails.
 
 2. **HTTP / REST Gateway (Port 3070)**:
    - `GET /`: Visual web snapshot monitor with a manual refresh and a state-aware display toggle (shows "关闭副屏" while the display is running and "开启副屏" once it is stopped; greyed out when the gateway is unreachable). The snapshot area sizes itself to the browser viewport, so the whole frame is visible without scrolling.
