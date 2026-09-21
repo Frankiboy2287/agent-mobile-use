@@ -1,6 +1,6 @@
 id=agent_mobile_use
 name=Agent Mobile Sandbox & Tools
-version=v4.6
-versionCode=46
-author=酸小明
-description=工业级后台独立虚拟副屏与全能 Mobile Use 最终完全体 (Display 状态驱动自愈点灯、ask_user_question 前台浮动通知与半屏卡片、模式C自适应免聚焦输入、前后台模式无缝切换、前台自适应边缘呼吸光效、物理屏幕自适应、REST API、主屏100%隐形静默)
+version=v4.7-xiaomi
+versionCode=47
+author=酸小明 (小米/HyperOS 适配: Frankiboy2287)
+description=工业级后台独立虚拟副屏与全能 Mobile Use 最终完全体 (Display 状态驱动自愈点灯、ask_user_question 前台浮动通知与半屏卡片、模式C自适应免聚焦输入、前后台模式无缝切换、前台自适应边缘呼吸光效、物理屏幕自适应、REST API、主屏100%隐形静默)。v4.7 新增: 跨厂商 BOOTCLASSPATH 动态解析(适配小米 HyperOS/Android 17)、SurfaceFlinger token 截图、IME 策略 ServiceManager 绕行、type 四级焦点回退、vd doctor 自检、FolkPatch/APatch 支持
