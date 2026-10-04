@@ -1,0 +1,171 @@
+#!/system/bin/sh
+# Agent Mobile Use - Lightweight CLI gateway wrapper
+BASE_URL="http://127.0.0.1:3070"
+
+# Minimal JSON string escaper: backslash, double-quote, newline, CR, tab.
+# Historical note: an earlier version interpolated raw "$2/$3" into the curl
+# -d template, which broke on quotes/backslashes and silently dropped multi-word
+# args; do not re-inline raw parameters into JSON without escaping first.
+json_escape() {
+    printf '%s' "$1" | awk '
+    BEGIN { ORS = "" }
+    {
+        if (NR > 1) printf "\\n"
+        gsub(/\\/, "\\\\")
+        gsub(/"/, "\\\"")
+        gsub(/\r/, "\\r")
+        gsub(/\t/, "\\t")
+        printf "%s", $0
+    }'
+}
+SERVER_BIN="/data/adb/modules/agent_mobile_use/bin/vd_server"
+if [ ! -x "$SERVER_BIN" ]; then
+    SERVER_BIN="$(cd "$(dirname "$0")/../.." && pwd)/bin/vd_server"
+fi
+
+# 跨厂商 BOOTCLASSPATH 解析器（小米/HyperOS 适配）。vd 本体是薄封装，不再需要它，
+# 但 `vd doctor` 会加载它做环境自检；run_daemon.sh 也依赖同一份文件。
+VD_ENV="/data/adb/modules/agent_mobile_use/bin/vd_env.sh"
+if [ ! -f "$VD_ENV" ]; then
+    VD_ENV="$(cd "$(dirname "$0")/../.." && pwd)/bin/vd_env.sh"
+fi
+[ -f "$VD_ENV" ] || VD_ENV="/data/local/tmp/vd_env.sh"
+
+ensure_server() {
+    if ! curl -s --max-time 1 "$BASE_URL/api/status" >/dev/null 2>&1; then
+        if [ -x "$SERVER_BIN" ]; then
+            nohup "$SERVER_BIN" > /data/local/tmp/vd_server.log 2>&1 &
+            for i in $(seq 1 20); do
+                sleep 0.1
+                curl -s --max-time 1 "$BASE_URL/api/status" >/dev/null 2>&1 && break
+            done
+        fi
+    fi
+}
+
+case "$1" in
+    start)
+        ensure_server
+        curl -s -X POST "$BASE_URL/api/start"
+        echo ""
+        ;;
+    stop)
+        curl -s -X POST "$BASE_URL/api/stop"
+        echo ""
+        ;;
+    restart)
+        curl -s -X POST "$BASE_URL/api/stop" >/dev/null 2>&1
+        sleep 0.5
+        ensure_server
+        curl -s -X POST "$BASE_URL/api/start"
+        echo ""
+        ;;
+    status)
+        curl -s "$BASE_URL/api/status"
+        echo ""
+        ;;
+    mode)
+        ensure_server
+        curl -s -X POST "$BASE_URL/api/mode?mode=$2"
+        echo ""
+        ;;
+    launch)
+        ensure_server
+        shift
+        pkg=$(json_escape "$*")
+        curl -s -X POST "$BASE_URL/api/action" -H "Content-Type: application/json" -d "{\"action\": \"launch_app\", \"package\": \"$pkg\"}"
+        echo ""
+        ;;
+    tree|dump)
+        ensure_server
+        curl -s "$BASE_URL/api/dump_ui?raw=1"
+        ;;
+    tap)
+        ensure_server
+        curl -s -X POST "$BASE_URL/api/action" -H "Content-Type: application/json" -d "{\"action\": \"click\", \"coordinate\": [$2, $3]}"
+        echo ""
+        ;;
+    swipe)
+        ensure_server
+        curl -s -X POST "$BASE_URL/api/action" -H "Content-Type: application/json" -d "{\"action\": \"swipe\", \"coordinate\": [$2, $3], \"end_coordinate\": [$4, $5], \"duration_ms\": ${6:-300}}"
+        echo ""
+        ;;
+    set_value)
+        ensure_server
+        if [ "$#" -ge 3 ]; then
+            target=$(json_escape "$2")
+            shift 2
+            text=$(json_escape "$*")
+            curl -s -X POST "$BASE_URL/api/action" -H "Content-Type: application/json" -d "{\"action\": \"set_value\", \"target\": \"$target\", \"text\": \"$text\"}"
+        else
+            text=$(json_escape "$2")
+            curl -s -X POST "$BASE_URL/api/action" -H "Content-Type: application/json" -d "{\"action\": \"set_value\", \"text\": \"$text\"}"
+        fi
+        echo ""
+        ;;
+    key)
+        ensure_server
+        key=$(json_escape "$2")
+        curl -s -X POST "$BASE_URL/api/action" -H "Content-Type: application/json" -d "{\"action\": \"key\", \"key\": \"$key\"}"
+        echo ""
+        ;;
+    screenshot)
+        ensure_server
+        out="${2:-/data/local/tmp/vd_screenshot.jpg}"
+        if curl -s -f "$BASE_URL/api/screenshot" -o "$out"; then
+            echo "[vd] 快照已保存至: $out"
+        else
+            echo "[vd] 截图失败"
+            exit 1
+        fi
+        ;;
+    apps|list_apps)
+        ensure_server
+        curl -s "$BASE_URL/api/apps?raw=1&query=$2"
+        ;;
+    doctor)
+        echo "==================== vd doctor ===================="
+        echo "[环境]"
+        echo "  设备: $(getprop ro.product.brand) $(getprop ro.product.model) ($(getprop ro.product.device))"
+        echo "  系统: Android $(getprop ro.build.version.release) (SDK $(getprop ro.build.version.sdk))"
+        echo "  版本: $(getprop ro.build.version.incremental)"
+        echo "  Root: $(if [ -d /data/adb/ap ]; then echo FolkPatch/APatch; elif [ -d /data/adb/ksu ]; then echo KernelSU; elif [ -d /data/adb/magisk ]; then echo Magisk; else echo 未知; fi)"
+        echo
+        echo "[跨厂商 BOOTCLASSPATH]"
+        if [ -f "$VD_ENV" ]; then
+            . "$VD_ENV" 2>/dev/null
+            if command -v vd_bootclasspath_summary >/dev/null 2>&1; then
+                vd_bootclasspath_summary | sed 's/^/  /'
+            else
+                echo "  vd_env.sh 已加载但未提供 vd_bootclasspath_summary"
+            fi
+        else
+            echo "  未部署 vd_env.sh ($VD_ENV)"
+        fi
+        echo
+        echo "[模块文件]"
+        for f in "$SERVER_BIN" "$VD_ENV"; do
+            if [ -f "$f" ]; then echo "  OK   $f"; else echo "  缺失 $f"; fi
+        done
+        echo
+        echo "[Web 网关 3070]"
+        if curl -s --max-time 3 "$BASE_URL/api/status" >/dev/null 2>&1; then
+            curl -s --max-time 3 "$BASE_URL/api/status"
+            echo ""
+        else
+            echo "  未运行 (可执行 vd start)"
+        fi
+        echo "==================================================="
+        ;;
+    *)
+        echo "Agent Mobile Use - 虚拟副屏控制 CLI"
+        echo ""
+        echo "用法: vd <command> [args...]"
+        echo "  start | stop | restart | status | mode <fg|bg|idle>"
+        echo "  launch <pkg> [--user <id>]"
+        echo "  tree | tap <x> <y> | swipe <x1> <y1> <x2> <y2> [ms]"
+        echo "  set_value [target] <text> | key <keycode>"
+        echo "  screenshot [path] | apps [query]"
+        echo "  doctor  (环境自检: 机型 / 跨厂商 BOOTCLASSPATH / 依赖 / 网关)"
+        ;;
+esac
